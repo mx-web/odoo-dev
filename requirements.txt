@@ -1,0 +1,2 @@
+# Python dependencies of your own addons, installed into the Odoo image.
+# Rebuild after changes: ./odev build (or ./odev up --build)

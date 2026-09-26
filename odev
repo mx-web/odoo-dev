@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# odev — one command for the whole Odoo dev stack.
+#   ./odev help
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
+
+[ -f .env ] || { cp .env.example .env; echo "odev: created .env from .env.example"; }
+set -a
+# shellcheck disable=SC1091
+. ./.env
+set +a
+
+DB_DEFAULT="${ODOO_DB:-odoo}"
+BLUE=$'\033[34m'; RED=$'\033[31m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+
+say()  { printf '%s==>%s %s\n' "$BLUE" "$OFF" "$*"; }
+die()  { printf '%sError:%s %s\n' "$RED" "$OFF" "$*" >&2; exit 1; }
+dc()   { docker compose "$@"; }
+
+confirm() {
+    local ok
+    read -r -p "$1 [y/N] " ok
+    [ "$ok" = y ] || [ "$ok" = Y ]
+}
+
+# Is the odoo service running? Decides between exec (fast) and run (own container).
+odoo_running() { [ -n "$(dc ps -q odoo 2>/dev/null </dev/null)" ]; }
+
+# odoo CLI in the running container or in a throwaway one.
+# "run" does not publish ports -> no conflict with the server.
+odoo_cli() {
+    if odoo_running; then dc exec -T odoo odoo "$@"; else dc run --rm -T odoo odoo "$@"; fi
+}
+odoo_oneshot() { dc run --rm -T odoo odoo "$@"; }
+
+# Shell script (stdin) inside the odoo container, running or not.
+odoo_sh() {
+    if odoo_running; then dc exec -T "$@" odoo bash -s; else dc run --rm -T "$@" odoo bash -s; fi
+}
+
+# For schema changes: stop the running server, run the command, bring the
+# server back. With both running at once, the two registry loads collide
+# ("could not serialize access due to concurrent update") and the database is
+# left half-migrated.
+odoo_maintenance() {
+    local was_up=0 rc=0
+    if odoo_running; then was_up=1; dc stop odoo >/dev/null 2>&1; fi
+    dc run --rm -T odoo odoo "$@" || rc=$?
+    if [ "$was_up" = 1 ]; then dc up -d odoo >/dev/null 2>&1; fi
+    return $rc
+}
+
+# stdin detached: otherwise psql swallows the answer to the next prompt
+psql_db() { dc exec -T db psql -v ON_ERROR_STOP=1 -U "${DB_USER:-odoo}" "$@" </dev/null; }
+
+db_exists() {
+    [ "$(psql_db -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$1'" 2>/dev/null)" = "1" ]
+}
+
+require_db() {
+    db_exists "$1" || die "database '$1' does not exist. Create it with: ./odev init $1"
+}
+
+# Kill open connections, otherwise DROP/restore fails.
+kick_connections() {
+    psql_db -d postgres -c \
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname='$1' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+}
+
+show_file() { printf '   %s  %s\n' "$1" "$(du -h "$1" | cut -f1)"; }
+
+set_env() {
+    sed -i.bak "s|^$1=.*|$1=$2|" .env && rm -f .env.bak
+}
+
+usage() {
+    cat <<'TXT'
+odev — Odoo dev stack
+
+  Stack
+    up [--mail] [--tools] [--build]   Start the stack (optional profiles)
+    down [-v]                         Stop; -v also deletes the volumes
+    restart [service]                 Restart (default: odoo)
+    build [--no-cache]                Rebuild the image
+    ps | logs [-f] [service]          Containers / logs
+    status                            Quick health check
+    version [tag]                     Show or switch the Odoo version
+    mode [fast|live]                  Show or switch the dev mode (see README)
+
+  Database
+    init [db] [--demo]                Create a new database with base
+    drop [db]                         Delete a database including its filestore
+    reset                             Wipe everything and start fresh
+    psql [db]                         psql prompt
+    duplicate <source> <target>       Copy a database including filestore
+
+  Modules
+    install <mod,...> [db]            Install modules
+    upgrade <mod,...> [db]            Upgrade modules
+    update-all [db]                   Upgrade all modules
+    uninstall <mod,...> [db]          Uninstall modules
+    test <mod,...>                    Run tests in a throwaway database
+    scaffold <name>                   Create a new addon in ./addons
+
+  Data
+    backup [db]                       Dump + filestore to ./backups
+    restore <file> [db]               Restore a dump (neutralized)
+    pull-prod [db]                    Fetch a production dump and restore it
+    neutralize [db]                   Disable crons, mail servers, webhooks
+
+  Misc
+    shell [db]                        Odoo shell (Python, with env)
+    bash                              Shell in the odoo container
+    open                              Open Odoo in the browser
+TXT
+}
+
+# --------------------------------------------------------------------------
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+
+up)
+    profiles=(); build=0
+    for a in "$@"; do
+        case "$a" in
+            --mail)  profiles+=(mail) ;;
+            --tools) profiles+=(tools) ;;
+            --build) build=1 ;;
+            *) die "unknown option: $a" ;;
+        esac
+    done
+    if [ ${#profiles[@]} -gt 0 ]; then
+        COMPOSE_PROFILES="$(IFS=,; echo "${profiles[*]}")"; export COMPOSE_PROFILES
+    fi
+    [ "$build" = 1 ] && dc build
+    dc up -d --remove-orphans
+    say "Odoo:    http://localhost:${ODOO_PORT:-8069}"
+    [[ " ${profiles[*]-} " == *" mail "* ]]  && say "Mailpit: http://localhost:${MAILPIT_UI_PORT:-8026}"
+    [[ " ${profiles[*]-} " == *" tools "* ]] && say "Adminer: http://localhost:${ADMINER_PORT:-8081}"
+    echo "${DIM}Logs: ./odev logs -f${OFF}"
+    ;;
+
+down)    dc --profile mail --profile tools down "$@" ;;
+restart) dc restart "${@:-odoo}" ;;
+build)   dc build "$@" ;;
+ps)      dc ps ;;
+logs)    dc logs "${@:---tail=100}" ;;
+
+status)
+    dc ps
+    echo
+    say "Odoo health"
+    curl -fsS --max-time 5 "http://localhost:${ODOO_PORT:-8069}/web/health" && echo \
+        || echo "  not reachable"
+    say "Databases"
+    psql_db -d postgres -tAc \
+        "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+        2>/dev/null | sed 's/^/  /' || echo "  db is not running"
+    say "Addons paths"
+    odoo_running && dc exec -T odoo bash -c 'ls -1 /mnt/addons/*/ 2>/dev/null | head -30' </dev/null || true
+    ;;
+
+mode)
+    # fast: templates, views and assets cached (pages in ms instead of seconds).
+    # live: --dev=xml re-reads them on every request – no upgrade needed,
+    #       but every page costs several seconds.
+    fast_args="--dev=reload"; live_args="--dev=reload,qweb,xml"
+    if [ $# -eq 0 ]; then
+        case "${ODOO_EXTRA_ARGS:-}" in
+            *xml*) echo "live (${ODOO_EXTRA_ARGS})" ;;
+            *)     echo "fast (${ODOO_EXTRA_ARGS:-empty})" ;;
+        esac
+        exit 0
+    fi
+    case "$1" in
+        fast) args="$fast_args" ;;
+        live) args="$live_args" ;;
+        *) die "usage: ./odev mode [fast|live]" ;;
+    esac
+    set_env ODOO_EXTRA_ARGS "$args"
+    export ODOO_EXTRA_ARGS="$args"
+    say "mode $1 (${args}) — recreating odoo"
+    dc up -d odoo
+    if [ "$1" = fast ]; then
+        echo "${DIM}SCSS/JS changed: ./odev restart · XML views changed: ./odev upgrade <module>${OFF}"
+    fi
+    ;;
+
+version)
+    if [ $# -eq 0 ]; then
+        echo "configured: ${ODOO_VERSION}"
+        odoo_running && dc exec -T odoo odoo --version || true
+    else
+        new="$1"
+        set_env ODOO_VERSION "$new"
+        export ODOO_VERSION="$new"
+        say "ODOO_VERSION=${new} — rebuilding"
+        dc build && say "done. './odev up' starts the new version."
+        echo "${DIM}Note: existing databases are tied to the old version.${OFF}"
+        echo "${DIM}For a clean slate: ./odev reset${OFF}"
+    fi
+    ;;
+
+init)
+    db="$DB_DEFAULT"; demo="--without-demo=all"
+    for a in "$@"; do
+        case "$a" in
+            --demo) demo="" ;;
+            *) db="$a" ;;
+        esac
+    done
+    dc up -d --wait db
+    db_exists "$db" && die "database '$db' already exists."
+    say "creating '$db' (base${demo:+, without demo data})"
+    # shellcheck disable=SC2086
+    odoo_oneshot -d "$db" -i base $demo --stop-after-init
+    say "done — login admin / admin"
+    ;;
+
+drop)
+    db="${1:-$DB_DEFAULT}"
+    require_db "$db"
+    confirm "Delete database '$db' including its filestore?" || exit 0
+    kick_connections "$db"
+    psql_db -d postgres -c "DROP DATABASE IF EXISTS \"$db\";"
+    odoo_sh -e FS_DB="$db" <<'SH' 2>/dev/null || true
+rm -rf "/var/lib/odoo/filestore/$FS_DB"
+SH
+    say "'$db' deleted"
+    ;;
+
+reset)
+    confirm "Delete containers AND volumes, then set up from scratch?" || exit 0
+    dc --profile mail --profile tools down -v
+    "$0" init "$DB_DEFAULT"
+    dc up -d
+    say "fresh stack at http://localhost:${ODOO_PORT:-8069}"
+    ;;
+
+psql)
+    db="${1:-$DB_DEFAULT}"
+    dc exec db psql -U "${DB_USER:-odoo}" -d "$db"
+    ;;
+
+duplicate)
+    [ $# -eq 2 ] || die "usage: ./odev duplicate <source> <target>"
+    require_db "$1"
+    kick_connections "$1"
+    odoo_cli db duplicate "$1" "$2"
+    say "'$1' -> '$2' copied"
+    ;;
+
+install|upgrade|uninstall)
+    [ $# -ge 1 ] || die "usage: ./odev $cmd <module>[,<module>] [db]"
+    mods="$1"; shift
+    db="${1:-$DB_DEFAULT}"
+    require_db "$db"
+    case "$cmd" in
+        install) say "installing $mods in '$db'"; odoo_maintenance -d "$db" -i "$mods" --stop-after-init ;;
+        upgrade) say "upgrading $mods in '$db'"; odoo_maintenance -d "$db" -u "$mods" --stop-after-init ;;
+        uninstall)
+            say "uninstalling $mods from '$db'"
+            odoo_cli shell -d "$db" <<PY
+mods = env["ir.module.module"].search([("name", "in", "$mods".split(","))])
+mods.button_immediate_uninstall()
+env.cr.commit()
+print("uninstalled:", mods.mapped("name"))
+PY
+            ;;
+    esac
+    odoo_running && say "Odoo is running again"
+    ;;
+
+update-all)
+    db="${1:-$DB_DEFAULT}"
+    require_db "$db"
+    say "upgrading all modules in '$db'"
+    odoo_maintenance -d "$db" -u all --stop-after-init
+    ;;
+
+test)
+    [ $# -ge 1 ] || die "usage: ./odev test <module>[,<module>]"
+    mods="$1"
+    testdb="test_$(date +%H%M%S)"
+    tags="/${mods//,/,/}"
+    say "running tests for $mods in throwaway database '$testdb'"
+    trap 'kick_connections "$testdb"; psql_db -d postgres -c "DROP DATABASE IF EXISTS \"$testdb\";" >/dev/null 2>&1 || true' EXIT
+    odoo_oneshot -d "$testdb" -i "$mods" --test-enable --test-tags "$tags" \
+        --stop-after-init --log-level=test
+    ;;
+
+scaffold)
+    [ $# -eq 1 ] || die "usage: ./odev scaffold <name>"
+    odoo_cli scaffold "$1" /mnt/addons/local
+    say "created ./addons/$1"
+    ;;
+
+backup)
+    db="${1:-$DB_DEFAULT}"
+    require_db "$db"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    out="${db}-${stamp}.zip"
+    say "backing up '$db' to backups/$out"
+    kick_connections "$db"
+    odoo_sh -e BK_DB="$db" -e BK_OUT="$out" -e LC_ALL=C -e LANG=C <<'SH'
+set -euo pipefail
+work="$(mktemp -d)"
+pg_dump --no-owner --no-privileges -h "$DB_HOST" -U "$DB_USER" -f "$work/dump.sql" "$BK_DB"
+if [ -d "/var/lib/odoo/filestore/$BK_DB" ]; then
+    cp -r "/var/lib/odoo/filestore/$BK_DB" "$work/filestore"
+else
+    mkdir -p "$work/filestore"
+fi
+cd "$work"
+python3 -m zipfile -c "/backups/$BK_OUT" dump.sql filestore
+rm -rf "$work"
+SH
+    show_file "backups/$out"
+    ;;
+
+restore)
+    [ $# -ge 1 ] || die "usage: ./odev restore <file.zip> [db] [--no-neutralize]"
+    src="$1"; shift
+    db="$DB_DEFAULT"; neutral=1
+    for a in "$@"; do
+        case "$a" in
+            --no-neutralize) neutral=0 ;;
+            *) db="$a" ;;
+        esac
+    done
+    [ -f "$src" ] || die "file not found: $src"
+    base="$(basename "$src")"
+    [ -f "backups/$base" ] || cp "$src" "backups/$base"
+
+    dc up -d --wait db >/dev/null
+    if db_exists "$db"; then
+        confirm "'$db' exists and will be overwritten. Continue?" || exit 0
+    fi
+    kick_connections "$db"
+    psql_db -d postgres -c "DROP DATABASE IF EXISTS \"$db\";" >/dev/null
+    psql_db -d postgres -c "CREATE DATABASE \"$db\" TEMPLATE template0 ENCODING 'UTF8';" >/dev/null
+
+    say "restoring backups/$base into '$db'"
+    odoo_sh -e RS_DB="$db" -e RS_FILE="$base" -e LC_ALL=C -e LANG=C <<'SH'
+set -euo pipefail
+work="$(mktemp -d)"
+python3 -m zipfile -e "/backups/$RS_FILE" "$work"
+[ -f "$work/dump.sql" ] || { echo "dump.sql missing from archive" >&2; exit 1; }
+psql -q -h "$DB_HOST" -U "$DB_USER" -d "$RS_DB" -f "$work/dump.sql" >/dev/null
+rm -rf "/var/lib/odoo/filestore/$RS_DB"
+mkdir -p /var/lib/odoo/filestore
+if [ -d "$work/filestore" ]; then
+    mv "$work/filestore" "/var/lib/odoo/filestore/$RS_DB"
+fi
+rm -rf "$work"
+SH
+    if [ "$neutral" = 1 ]; then
+        say "neutralizing '$db' — no mails, no crons, no webhooks"
+        odoo_cli neutralize -d "$db" || echo "${DIM}neutralize not available (Odoo < 16)${OFF}"
+    else
+        printf '%sWARNING:%s not neutralized — crons and mail servers are live.\n' "$RED" "$OFF"
+    fi
+    if odoo_running; then dc restart odoo >/dev/null; fi
+    say "done"
+    ;;
+
+pull-prod)
+    db="${1:-$DB_DEFAULT}"
+    [ -n "${PROD_URL:-}" ] || die "PROD_URL missing in .env"
+    [ -n "${PROD_DB:-}" ] || die "PROD_DB missing in .env"
+    [ -n "${PROD_MASTER_PW:-}" ] || die "PROD_MASTER_PW missing in .env (master password of the production instance)"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    out="backups/prod-${stamp}.zip"
+    say "fetching dump from $PROD_URL"
+    # Password via stdin, so it does not show up in the process list
+    printf '%s' "$PROD_MASTER_PW" | curl -fsS --max-time 1800 -X POST \
+        -F "master_pwd=<-" \
+        -F "name=${PROD_DB}" \
+        -F "backup_format=zip" \
+        "${PROD_URL%/}/web/database/backup" -o "$out" \
+        || die "dump failed — check PROD_URL, PROD_DB and the master password"
+    # Error pages come back as HTML with status 200
+    head -c 2 "$out" | grep -q PK || { rm -f "$out"; die "response was not a ZIP — probably a wrong master password"; }
+    show_file "$out"
+    "$0" restore "$out" "$db"
+    ;;
+
+neutralize)
+    db="${1:-$DB_DEFAULT}"
+    require_db "$db"
+    odoo_cli neutralize -d "$db"
+    say "'$db' neutralized"
+    ;;
+
+shell)
+    db="${1:-$DB_DEFAULT}"
+    require_db "$db"
+    dc exec odoo odoo shell -d "$db"
+    ;;
+
+bash) dc exec odoo bash ;;
+
+open)
+    url="http://localhost:${ODOO_PORT:-8069}"
+    if command -v open >/dev/null; then open "$url"
+    elif command -v xdg-open >/dev/null; then xdg-open "$url"
+    else echo "$url"; fi
+    ;;
+
+help|--help|-h) usage ;;
+*) usage; die "unknown command: $cmd" ;;
+esac

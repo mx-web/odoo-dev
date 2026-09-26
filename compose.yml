@@ -1,0 +1,107 @@
+services:
+  db:
+    image: postgres:${POSTGRES_VERSION:-17-alpine}
+    environment:
+      POSTGRES_USER: ${DB_USER:-odoo}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-odoo}
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - db-data:/var/lib/postgresql/data/pgdata
+    ports:
+      # Only for external DB clients. On a port clash, change it in .env —
+      # Odoo itself talks to Postgres over the internal network, not this port.
+      - "${DB_HOST_PORT:-5435}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-odoo} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [odoo]
+
+  odoo:
+    build:
+      context: .
+      args:
+        ODOO_VERSION: ${ODOO_VERSION:-19.0}
+    image: odoo-dev:${ODOO_VERSION:-19.0}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-odoo}
+      DB_PASSWORD: ${DB_PASSWORD:-odoo}
+      DB_MAXCONN: ${DB_MAXCONN:-64}
+      DB_FILTER: ${DB_FILTER:-.*}
+      LIST_DB: ${LIST_DB:-True}
+      ADMIN_PASSWD: ${ADMIN_PASSWD:-admin}
+      ADDONS_PATH: /mnt/addons/local,/mnt/addons/custom,/mnt/addons/oca
+      PROXY_MODE: ${PROXY_MODE:-False}
+      WORKERS: ${WORKERS:-0}
+      MAX_CRON_THREADS: ${MAX_CRON_THREADS:-2}
+      LIMIT_TIME_CPU: ${LIMIT_TIME_CPU:-600}
+      LIMIT_TIME_REAL: ${LIMIT_TIME_REAL:-1200}
+      LIMIT_MEMORY_SOFT: ${LIMIT_MEMORY_SOFT:-2147483648}
+      LIMIT_MEMORY_HARD: ${LIMIT_MEMORY_HARD:-2684354560}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_HANDLER: ${LOG_HANDLER:-:INFO}
+      SMTP_SERVER: ${SMTP_SERVER:-mail}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      EMAIL_FROM: ${EMAIL_FROM:-odoo@localhost}
+      PGPASSWORD: ${DB_PASSWORD:-odoo}
+    command: odoo ${ODOO_EXTRA_ARGS:---dev=reload}
+    ports:
+      - "${ODOO_PORT:-8069}:8069"
+      - "${ODOO_GEVENT_PORT:-8072}:8072"
+    volumes:
+      - ./config/odoo.conf.tpl:/etc/odoo/odoo.conf.tpl:ro
+      - ./addons:/mnt/addons/local
+      - ${CUSTOM_ADDONS:-./addons}:/mnt/addons/custom
+      - ./oca:/mnt/addons/oca
+      - ./backups:/backups
+      - odoo-data:/var/lib/odoo
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8069/web/health', timeout=5).status == 200 else 1)"
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    networks: [odoo]
+
+  # Mail trap. Catches every outgoing mail instead of delivering it: "./odev up --mail"
+  mail:
+    image: axllent/mailpit:latest
+    profiles: [mail]
+    ports:
+      - "${MAILPIT_UI_PORT:-8026}:8025"
+      - "${MAILPIT_SMTP_PORT:-1026}:1025"
+    restart: unless-stopped
+    networks: [odoo]
+
+  # Postgres web UI: "./odev up --tools"
+  adminer:
+    image: adminer:latest
+    profiles: [tools]
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    ports:
+      - "${ADMINER_PORT:-8081}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [odoo]
+
+volumes:
+  db-data:
+  odoo-data:
+
+networks:
+  odoo:
+    driver: bridge

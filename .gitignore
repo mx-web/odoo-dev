@@ -1,0 +1,10 @@
+.env
+backups/*
+!backups/.gitkeep
+addons/*
+!addons/.gitkeep
+oca/*
+!oca/.gitkeep
+*.bak
+.DS_Store
+__pycache__/
