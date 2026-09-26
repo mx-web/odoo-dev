@@ -19,8 +19,9 @@ git clone https://github.com/<you>/odoo-dev.git && cd odoo-dev
   `./odev version 18.0`.
 - **One config file** — `odoo.conf` is rendered from `.env` at container start.
   Nothing hidden in three layers of config.
-- **Fast dev loop** — `--dev=reload` by default, plus a `live` mode that
-  re-reads templates and views on every request.
+- **Fast dev loop** — `--dev=reload` for Python, Compose Watch restarts Odoo
+  when assets change, and a `live` mode re-reads templates and views on every
+  request.
 - **Safe installs and upgrades** — the server is stopped while `-i`/`-u` runs,
   so two registry loads never race each other.
 - **Tests in throwaway databases** — created, run and dropped in one command.
@@ -34,7 +35,7 @@ git clone https://github.com/<you>/odoo-dev.git && cd odoo-dev
 
 ## Requirements
 
-- Docker with the Compose plugin (`docker compose`, v2.1 or newer)
+- Docker with the Compose plugin (`docker compose`, v2.32 or newer for `./odev watch`)
 - Bash (macOS or Linux; on Windows use WSL2)
 - `curl` for `./odev status` and `./odev pull-prod`
 
@@ -46,6 +47,7 @@ git clone https://github.com/<you>/odoo-dev.git && cd odoo-dev
 ./odev init demo --demo      # a second database, with demo data
 ./odev install sale,stock    # install modules into the default database
 ./odev logs -f               # follow the logs
+./odev watch                 # optional: auto-restart on SCSS/JS changes
 ```
 
 Odoo runs at <http://localhost:8069>, login `admin` / `admin`.
@@ -116,7 +118,8 @@ cd oca && ln -s src/web/web_responsive . && cd ..
 ```
 
 **Python dependencies** of your addons go into `requirements.txt`, then
-`./odev build` (or `./odev up --build`).
+`./odev build` (or `./odev up --build`) — or, with `./odev watch` running,
+just save the file.
 
 ## How configuration works
 
@@ -172,7 +175,8 @@ are given comma-separated: `sale,stock`.
 
 | Command | |
 |---|---|
-| `./odev up [--mail] [--tools] [--build]` | Start the stack. `--mail` adds Mailpit, `--tools` Adminer, `--build` rebuilds first |
+| `./odev up [--mail] [--tools] [--build] [--watch]` | Start the stack. `--mail` adds Mailpit, `--tools` Adminer, `--build` rebuilds first, `--watch` stays in the foreground and watches for changes |
+| `./odev watch` | Watch for changes: restart Odoo on asset changes, rebuild on image changes (Ctrl+C to stop, the stack keeps running) |
 | `./odev down [-v]` | Stop everything; `-v` also deletes the volumes (databases and filestore!) |
 | `./odev restart [service]` | Restart a service (default `odoo`) |
 | `./odev build [--no-cache]` | Rebuild the image |
@@ -236,7 +240,7 @@ current mode):
 
 | Mode | `ODOO_EXTRA_ARGS` | Page load | After changes |
 |---|---|---|---|
-| **fast** (default) | `--dev=reload` | milliseconds | Python: automatic · SCSS/JS: `./odev restart` · XML: `./odev upgrade <module>` |
+| **fast** (default) | `--dev=reload` | milliseconds | Python: automatic · SCSS/JS: `./odev restart`, automatic with `./odev watch` · XML views: `./odev upgrade <module>` |
 | **live** | `--dev=reload,qweb,xml` | 2–6 seconds | Python, XML, SCSS/JS: automatic |
 
 `xml` disables Odoo's template, view and asset caches at once — every page is
@@ -250,6 +254,28 @@ debugger works. For load tests set `WORKERS` to `(2 × CPU) + 1` and clear
 
 Structural changes — new fields, new models, changed access rules, new data
 files — always need `./odev upgrade <module>`.
+
+### Watch
+
+`./odev watch` runs [Compose Watch](https://docs.docker.com/compose/how-tos/file-watch/)
+on the `odoo` service (configured under `develop.watch` in `compose.yml`).
+The addons are bind-mounted, so nothing is copied — watch only triggers what
+`--dev=reload` can't do by itself:
+
+| Changed file | Action |
+|---|---|
+| `**/static/**/*.{scss,css,js,xml}` in `./addons`, `$CUSTOM_ADDONS`, `./oca` | restart Odoo (new asset bundles) |
+| `config/odoo.conf.tpl` | restart Odoo (config is re-rendered) |
+| `Dockerfile`, `requirements.txt`, `entrypoint.sh` | rebuild the image and recreate the container |
+| `*.py` | nothing — `--dev=reload` handles it |
+| `views/*.xml`, data files | nothing — needs `./odev upgrade <module>` |
+
+`static/lib/` (vendored libraries) is ignored. Watch runs in the foreground;
+keep it open in a spare terminal, or start everything at once with
+`./odev up --watch`. Stopping it with Ctrl+C leaves the stack running.
+
+In `live` mode, assets are rebuilt on every request anyway, so watch's
+restarts are unnecessary there — just don't run it.
 
 ### Tests
 
@@ -396,9 +422,10 @@ a file inside the container that nobody rotates.
 in `CUSTOM_ADDONS` must be the directory *containing* your modules. After
 adding a new module, update the apps list or just `./odev install <module>`.
 
-**Changes don't show up** — Python reloads automatically; XML needs
+**Changes don't show up** — Python reloads automatically; XML views need
 `./odev upgrade <module>` (or `./odev mode live`); SCSS/JS needs
-`./odev restart` in fast mode. Hard-refresh the browser afterwards.
+`./odev restart` in fast mode, or keep `./odev watch` running. Hard-refresh
+the browser afterwards.
 
 **`could not serialize access due to concurrent update`** — two Odoo
 processes loaded the registry at the same time. Use `./odev install` /

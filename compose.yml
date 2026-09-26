@@ -63,6 +63,30 @@ services:
       - ./oca:/mnt/addons/oca
       - ./backups:/backups
       - odoo-data:/var/lib/odoo
+    # "./odev watch" / "./odev up --watch". The addons are bind-mounted, so
+    # nothing needs syncing — watch only triggers what --dev=reload can't:
+    # a restart for changed assets, a rebuild for changed image inputs.
+    # Python reloads by itself; XML views still need "./odev upgrade <module>".
+    develop:
+      watch:
+        - &assets
+          path: ./addons
+          action: restart
+          # Only assets: static/**/*.xml are OWL templates, not views
+          include: ["**/static/**/*.scss", "**/static/**/*.css", "**/static/**/*.js", "**/static/**/*.xml"]
+          ignore: ["**/static/lib/**"]
+        - <<: *assets
+          path: ${CUSTOM_ADDONS:-./addons}
+        - <<: *assets
+          path: ./oca
+        - path: ./config/odoo.conf.tpl
+          action: restart
+        - path: ./requirements.txt
+          action: rebuild
+        - path: ./Dockerfile
+          action: rebuild
+        - path: ./entrypoint.sh
+          action: rebuild
     healthcheck:
       test:
         - CMD-SHELL

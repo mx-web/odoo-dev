@@ -81,7 +81,9 @@ usage() {
 odev — Odoo dev stack
 
   Stack
-    up [--mail] [--tools] [--build]   Start the stack (optional profiles)
+    up [--mail] [--tools] [--build] [--watch]
+                                      Start the stack (optional profiles)
+    watch                             Restart/rebuild odoo on asset/image changes
     down [-v]                         Stop; -v also deletes the volumes
     restart [service]                 Restart (default: odoo)
     build [--no-cache]                Rebuild the image
@@ -124,12 +126,13 @@ cmd="${1:-help}"; shift || true
 case "$cmd" in
 
 up)
-    profiles=(); build=0
+    profiles=(); build=0; watch=0
     for a in "$@"; do
         case "$a" in
             --mail)  profiles+=(mail) ;;
             --tools) profiles+=(tools) ;;
             --build) build=1 ;;
+            --watch) watch=1 ;;
             *) die "unknown option: $a" ;;
         esac
     done
@@ -141,7 +144,21 @@ up)
     say "Odoo:    http://localhost:${ODOO_PORT:-8069}"
     [[ " ${profiles[*]-} " == *" mail "* ]]  && say "Mailpit: http://localhost:${MAILPIT_UI_PORT:-8026}"
     [[ " ${profiles[*]-} " == *" tools "* ]] && say "Adminer: http://localhost:${ADMINER_PORT:-8081}"
-    echo "${DIM}Logs: ./odev logs -f${OFF}"
+    if [ "$watch" = 1 ]; then
+        echo "${DIM}watching for changes — Ctrl+C stops watching, the stack keeps running${OFF}"
+        dc watch --no-up odoo
+    else
+        echo "${DIM}Logs: ./odev logs -f · auto-restart on asset changes: ./odev watch${OFF}"
+    fi
+    ;;
+
+watch)
+    # compose.yml -> services.odoo.develop.watch. --no-up: never builds or
+    # recreates on start, "./odev up" stays in charge of that.
+    odoo_running || dc up -d
+    say "watching — assets: restart · Dockerfile/requirements.txt: rebuild"
+    echo "${DIM}Ctrl+C stops watching, the stack keeps running${OFF}"
+    dc watch --no-up odoo
     ;;
 
 down)    dc --profile mail --profile tools down "$@" ;;
@@ -186,7 +203,7 @@ mode)
     say "mode $1 (${args}) — recreating odoo"
     dc up -d odoo
     if [ "$1" = fast ]; then
-        echo "${DIM}SCSS/JS changed: ./odev restart · XML views changed: ./odev upgrade <module>${OFF}"
+        echo "${DIM}SCSS/JS changed: ./odev restart (or keep ./odev watch running) · XML views changed: ./odev upgrade <module>${OFF}"
     fi
     ;;
 
