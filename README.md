@@ -6,7 +6,7 @@ day: create databases, install and upgrade modules, run tests, back up and
 restore, and pull a neutralized copy of production.
 
 ```sh
-git clone https://github.com/<you>/odoo-dev.git && cd odoo-dev
+git clone https://github.com/mx-web/odoo-dev.git && cd odoo-dev
 ./odev up            # build and start the stack
 ./odev init          # create a database
 ./odev open          # http://localhost:8069, login admin / admin
